@@ -3,6 +3,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, List
 
+import numpy as np
 from livekit import api, rtc
 from loguru import logger
 from pipecat.frames.frames import (
@@ -19,6 +20,7 @@ from pipecat.transports.base_output import BaseOutputTransport
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.vad.vad_analyzer import VADAnalyzer
 from pydantic import BaseModel
+from scipy import signal
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 
@@ -52,6 +54,9 @@ class LiveKitParams(TransportParams):
     participant_name: str = ""
     audio_out_sample_rate: int = 48000
     audio_out_channels: int = 1
+    vad_enabled: bool = True
+    vad_analyzer: VADAnalyzer | None = None
+    audio_in_sample_rate: int = 16000
 
 
 class LiveKitCallbacks(BaseModel):
@@ -252,10 +257,9 @@ class LiveKitInputTransport(BaseInputTransport):
         self._client = client
         self._audio_in_task = None
         self._vad_analyzer: VADAnalyzer | None = params.vad_analyzer
+        self._current_sample_rate: int = params.audio_in_sample_rate
         if params.vad_enabled and not params.vad_analyzer:
-            self._vad_analyzer = VADAnalyzer(
-                sample_rate=self._params.audio_in_sample_rate, num_channels=self._params.audio_in_channels
-            )
+            self._vad_analyzer = VADAnalyzer(sample_rate=self._current_sample_rate, num_channels=self._params.audio_in_channels)
 
     async def start(self, frame: StartFrame):
         await super().start(frame)
@@ -300,6 +304,9 @@ class LiveKitInputTransport(BaseInputTransport):
                     audio_frame_event, participant_id = audio_data
                     pipecat_audio_frame = self._convert_livekit_audio_to_pipecat(audio_frame_event)
                     await self.push_audio_frame(pipecat_audio_frame)
+                    await self._internal_push_frame(
+                        pipecat_audio_frame
+                    )  # TODO: ensure audio frames are pushed with the default BaseInputTransport.push_audio_frame()
             except asyncio.CancelledError:
                 logger.info("Audio input task cancelled")
                 break
@@ -308,12 +315,26 @@ class LiveKitInputTransport(BaseInputTransport):
 
     def _convert_livekit_audio_to_pipecat(self, audio_frame_event: rtc.AudioFrameEvent) -> AudioRawFrame:
         audio_frame = audio_frame_event.frame
-        return AudioRawFrame(
-            audio=bytes(audio_frame.data), sample_rate=audio_frame.sample_rate, num_channels=audio_frame.num_channels
-        )
+        audio_data = np.frombuffer(audio_frame.data, dtype=np.int16)
+        original_sample_rate = audio_frame.sample_rate
 
-    async def push_audio_frame(self, frame: AudioRawFrame):
-        await super().push_audio_frame(frame)
+        # Allow 8kHz and 16kHz, convert anything else to 16kHz
+        if original_sample_rate not in [8000, 16000]:
+            audio_data = self._resample_audio(audio_data, original_sample_rate, 16000)
+            sample_rate = 16000
+        else:
+            sample_rate = original_sample_rate
+
+        if sample_rate != self._current_sample_rate:
+            self._current_sample_rate = sample_rate
+            self._vad_analyzer = VADAnalyzer(sample_rate=self._current_sample_rate, num_channels=self._params.audio_in_channels)
+
+        return AudioRawFrame(audio=audio_data.tobytes(), sample_rate=sample_rate, num_channels=audio_frame.num_channels)
+
+    def _resample_audio(self, audio_data: np.ndarray, original_rate: int, target_rate: int) -> np.ndarray:
+        num_samples = int(len(audio_data) * target_rate / original_rate)
+        resampled_audio = signal.resample(audio_data, num_samples)
+        return resampled_audio.astype(np.int16)
 
 
 class LiveKitOutputTransport(BaseOutputTransport):
