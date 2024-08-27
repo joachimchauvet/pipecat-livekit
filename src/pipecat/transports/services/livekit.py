@@ -8,6 +8,7 @@ from livekit import api, rtc
 from loguru import logger
 from pipecat.frames.frames import (
     AudioRawFrame,
+    CancelFrame,
     EndFrame,
     Frame,
     MetricsFrame,
@@ -83,13 +84,13 @@ class LiveKitTransportClient:
         self._audio_queue = asyncio.Queue()
 
         # Set up room event handlers
-        self._room.on("participant_connected")(self._on_participant_connected)
-        self._room.on("participant_disconnected")(self._on_participant_disconnected)
+        self._room.on("participant_connected")(self._on_participant_connected_wrapper)
+        self._room.on("participant_disconnected")(self._on_participant_disconnected_wrapper)
         self._room.on("track_subscribed")(self._on_track_subscribed_wrapper)
-        self._room.on("track_unsubscribed")(self._on_track_unsubscribed)
-        self._room.on("data_received")(self._on_data_received)
-        self._room.on("connected")(self._on_connected)
-        self._room.on("disconnected")(self._on_disconnected)
+        self._room.on("track_unsubscribed")(self._on_track_unsubscribed_wrapper)
+        self._room.on("data_received")(self._on_data_received_wrapper)
+        self._room.on("connected")(self._on_connected_wrapper)
+        self._room.on("disconnected")(self._on_disconnected_wrapper)
 
     @property
     def participant_id(self) -> str:
@@ -140,9 +141,9 @@ class LiveKitTransportClient:
 
         try:
             if participant_id:
-                await self._room.local_participant.publish_data(data, destination_sids=[participant_id])
+                await self._room.local_participant.publish_data(data, reliable=True, destination_identities=[participant_id])
             else:
-                await self._room.local_participant.publish_data(data)
+                await self._room.local_participant.publish_data(data, reliable=True)
         except Exception as e:
             logger.error(f"Error sending data: {e}")
 
@@ -186,26 +187,42 @@ class LiveKitTransportClient:
                 if track.kind == "audio":
                     await track.set_enabled(True)
 
-    def _on_participant_connected(self, participant: rtc.RemoteParticipant):
+    # Wrapper methods for event handlers
+    def _on_participant_connected_wrapper(self, participant: rtc.RemoteParticipant):
         asyncio.create_task(self._async_on_participant_connected(participant))
 
+    def _on_participant_disconnected_wrapper(self, participant: rtc.RemoteParticipant):
+        asyncio.create_task(self._async_on_participant_disconnected(participant))
+
+    def _on_track_subscribed_wrapper(
+        self, track: rtc.Track, publication: rtc.RemoteTrackPublication, participant: rtc.RemoteParticipant
+    ):
+        asyncio.create_task(self._async_on_track_subscribed(track, publication, participant))
+
+    def _on_track_unsubscribed_wrapper(
+        self, track: rtc.Track, publication: rtc.RemoteTrackPublication, participant: rtc.RemoteParticipant
+    ):
+        asyncio.create_task(self._async_on_track_unsubscribed(track, publication, participant))
+
+    def _on_data_received_wrapper(self, data: rtc.DataPacket):
+        asyncio.create_task(self._async_on_data_received(data))
+
+    def _on_connected_wrapper(self):
+        asyncio.create_task(self._async_on_connected())
+
+    def _on_disconnected_wrapper(self):
+        asyncio.create_task(self._async_on_disconnected())
+
+    # Async methods for event handling
     async def _async_on_participant_connected(self, participant: rtc.RemoteParticipant):
         logger.info(f"Participant connected: {participant.identity}")
         await self._callbacks.on_participant_connected(participant.sid)
-
-    def _on_participant_disconnected(self, participant: rtc.RemoteParticipant):
-        asyncio.create_task(self._async_on_participant_disconnected(participant))
 
     async def _async_on_participant_disconnected(self, participant: rtc.RemoteParticipant):
         logger.info(f"Participant disconnected: {participant.identity}")
         await self._callbacks.on_participant_disconnected(participant.sid)
 
-    def _on_track_subscribed_wrapper(
-        self, track: rtc.Track, publication: rtc.RemoteTrackPublication, participant: rtc.RemoteParticipant
-    ):
-        asyncio.create_task(self._on_track_subscribed(track, publication, participant))
-
-    async def _on_track_subscribed(
+    async def _async_on_track_subscribed(
         self, track: rtc.Track, publication: rtc.RemoteTrackPublication, participant: rtc.RemoteParticipant
     ):
         if track.kind == rtc.TrackKind.KIND_AUDIO:
@@ -214,19 +231,6 @@ class LiveKitTransportClient:
             audio_stream = rtc.AudioStream(track)
             asyncio.create_task(self._process_audio_stream(audio_stream, participant.sid))
 
-    async def _process_audio_stream(self, audio_stream: rtc.AudioStream, participant_id: str):
-        logger.info(f"Started processing audio stream for participant {participant_id}")
-        async for event in audio_stream:
-            if isinstance(event, rtc.AudioFrameEvent):
-                await self._audio_queue.put((event, participant_id))
-            else:
-                logger.warning(f"Received unexpected event type: {type(event)}")
-
-    def _on_track_unsubscribed(
-        self, track: rtc.Track, publication: rtc.RemoteTrackPublication, participant: rtc.RemoteParticipant
-    ):
-        asyncio.create_task(self._async_on_track_unsubscribed(track, publication, participant))
-
     async def _async_on_track_unsubscribed(
         self, track: rtc.Track, publication: rtc.RemoteTrackPublication, participant: rtc.RemoteParticipant
     ):
@@ -234,14 +238,24 @@ class LiveKitTransportClient:
         if track.kind == rtc.TrackKind.KIND_AUDIO:
             await self._callbacks.on_audio_track_unsubscribed(participant.sid)
 
-    async def _on_data_received(self, data: rtc.DataPacket):
+    async def _async_on_data_received(self, data: rtc.DataPacket):
         await self._callbacks.on_data_received(data.data, data.participant.sid)
 
-    async def _on_connected(self):
+    async def _async_on_connected(self):
         await self._callbacks.on_connected()
 
-    async def _on_disconnected(self):
+    async def _async_on_disconnected(self):
+        self._connected = False
+        logger.info(f"Disconnected from {self._params.room_name}")
         await self._callbacks.on_disconnected()
+
+    async def _process_audio_stream(self, audio_stream: rtc.AudioStream, participant_id: str):
+        logger.info(f"Started processing audio stream for participant {participant_id}")
+        async for event in audio_stream:
+            if isinstance(event, rtc.AudioFrameEvent):
+                await self._audio_queue.put((event, participant_id))
+            else:
+                logger.warning(f"Received unexpected event type: {type(event)}")
 
     async def cleanup(self):
         await self.disconnect()
@@ -268,25 +282,29 @@ class LiveKitInputTransport(BaseInputTransport):
             self._audio_in_task = asyncio.create_task(self._audio_in_task_handler())
         logger.info("LiveKitInputTransport started")
 
-    async def stop(self):
+    async def stop(self, frame: EndFrame):
         if self._audio_in_task:
             self._audio_in_task.cancel()
             try:
                 await self._audio_in_task
             except asyncio.CancelledError:
                 pass
-        await super().stop()
+        await super().stop(frame)
         await self._client.disconnect()
         logger.info("LiveKitInputTransport stopped")
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         if isinstance(frame, EndFrame):
-            await self.stop()
+            await self.stop(frame)
         else:
             await super().process_frame(frame, direction)
 
-    async def cancel(self):
-        await self.stop()
+    async def cancel(self, frame: CancelFrame):
+        await super().cancel(frame)
+        await self._client.disconnect()
+        if self._audio_in_task and (self._params.audio_in_enabled or self._params.vad_enabled):
+            self._audio_in_task.cancel()
+            await self._audio_in_task
 
     def vad_analyzer(self) -> VADAnalyzer | None:
         return self._vad_analyzer
@@ -347,8 +365,8 @@ class LiveKitOutputTransport(BaseOutputTransport):
         await self._client.connect()
         logger.info("LiveKitOutputTransport started")
 
-    async def stop(self):
-        await super().stop()
+    async def stop(self, frame: EndFrame):
+        await super().stop(frame)
         await self._client.disconnect()
         logger.info("LiveKitOutputTransport stopped")
 
@@ -358,8 +376,9 @@ class LiveKitOutputTransport(BaseOutputTransport):
         else:
             await super().process_frame(frame, direction)
 
-    async def cancel(self):
-        await self.stop()
+    async def cancel(self, frame: CancelFrame):
+        await super().cancel(frame)
+        await self._client.disconnect()
 
     async def send_message(self, frame: TransportMessageFrame):
         if isinstance(frame, LiveKitTransportMessageFrame):
