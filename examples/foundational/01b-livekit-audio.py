@@ -5,7 +5,7 @@ import sys
 
 import aiohttp
 from dotenv import load_dotenv
-from livekit import api
+from livekit import api  # pip install livekit-api
 from loguru import logger
 from pipecat.frames.frames import TextFrame
 from pipecat.pipeline.pipeline import Pipeline
@@ -32,7 +32,7 @@ def generate_token(room_name: str, participant_name: str, api_key: str, api_secr
     return token.to_jwt()
 
 
-async def configure_livekit(aiohttp_session: aiohttp.ClientSession):
+async def configure_livekit():
     parser = argparse.ArgumentParser(description="LiveKit AI SDK Bot Sample")
     parser.add_argument("-r", "--room", type=str, required=False, help="Name of the LiveKit room to join")
     parser.add_argument("-u", "--url", type=str, required=False, help="URL of the LiveKit server")
@@ -64,7 +64,7 @@ async def configure_livekit(aiohttp_session: aiohttp.ClientSession):
 
 async def main():
     async with aiohttp.ClientSession() as session:
-        (url, token, room_name) = await configure_livekit(session)
+        (url, token, room_name) = await configure_livekit()
 
         livekit_params = LiveKitParams(
             url=url,
