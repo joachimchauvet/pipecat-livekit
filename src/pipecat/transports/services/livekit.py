@@ -1,10 +1,9 @@
 import asyncio
-import os
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, List
 
 import numpy as np
-from livekit import api, rtc
+from livekit import rtc
 from loguru import logger
 from pipecat.frames.frames import (
     AudioRawFrame,
@@ -25,22 +24,13 @@ from scipy import signal
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 
-def generate_token(room_name: str, participant_name: str) -> str:
-    api_key = os.getenv("LIVEKIT_API_KEY")
-    api_secret = os.getenv("LIVEKIT_API_SECRET")
-
-    if not api_key or not api_secret:
-        raise ValueError("LIVEKIT_API_KEY and LIVEKIT_API_SECRET must be set in environment variables")
-
-    token = api.AccessToken(api_key, api_secret)
-    token.with_identity(participant_name).with_name(participant_name).with_grants(
-        api.VideoGrants(
-            room_join=True,
-            room=room_name,
-        )
-    )
-
-    return token.to_jwt()
+try:
+    from livekit.rtc import AudioFrame
+except ModuleNotFoundError as e:
+    logger.error(f"Exception: {e}")
+    logger.error(
+        "In order to use LiveKit, you need to `pip install pipecat-ai[livekit]`.")
+    raise Exception(f"Missing module: {e}")
 
 
 @dataclass
@@ -372,7 +362,7 @@ class LiveKitOutputTransport(BaseOutputTransport):
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         if isinstance(frame, EndFrame):
-            await self.stop()
+            await self.stop(frame)
         else:
             await super().process_frame(frame, direction)
 
