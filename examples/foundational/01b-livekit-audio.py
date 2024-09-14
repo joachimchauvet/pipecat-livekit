@@ -70,7 +70,6 @@ async def main():
             url=url,
             token=token,
             room_name=room_name,
-            participant_name="Say One Thing",
             params=LiveKitParams(audio_out_enabled=True)
         )
 
@@ -86,9 +85,8 @@ async def main():
         # Register an event handler so we can play the audio when the
         # participant joins.
         @transport.event_handler("on_participant_joined")
-        async def on_new_participant_joined(transport, participant):
-            participant_name = participant["info"]["userName"] or ""
-            await task.queue_frame(TextFrame(f"Hello there, {participant_name}!"))
+        async def on_first_participant_joined(transport, participant_id):
+            await task.queue_frame(TextFrame(f"Hello there!"))
 
         await runner.run(task)
 

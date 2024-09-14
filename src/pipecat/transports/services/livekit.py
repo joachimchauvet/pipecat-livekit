@@ -3,7 +3,6 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, List
 
 import numpy as np
-from livekit import rtc
 from loguru import logger
 from pipecat.frames.frames import (
     AudioRawFrame,
@@ -23,13 +22,11 @@ from pydantic import BaseModel
 from scipy import signal
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-
 try:
-    from livekit.rtc import AudioFrame
+    from livekit import rtc
 except ModuleNotFoundError as e:
     logger.error(f"Exception: {e}")
-    logger.error(
-        "In order to use LiveKit, you need to `pip install pipecat-ai[livekit]`.")
+    logger.error("In order to use LiveKit, you need to `pip install pipecat-ai[livekit]`.")
     raise Exception(f"Missing module: {e}")
 
 
@@ -62,15 +59,13 @@ class LiveKitTransportClient:
         url: str,
         token: str,
         room_name: str,
-        bot_name: str,
         params: LiveKitParams,
         callbacks: LiveKitCallbacks,
-        loop: asyncio.AbstractEventLoop
+        loop: asyncio.AbstractEventLoop,
     ):
         self._url = url
         self._token = token
         self._room_name = room_name
-        self._bot_name = bot_name
         self._params = params
         self._callbacks = callbacks
         self._loop = loop
@@ -422,7 +417,6 @@ class LiveKitTransport(BaseTransport):
         url: str,
         token: str,
         room_name: str,
-        bot_name: str,
         params: LiveKitParams = LiveKitParams(),
         input_name: str | None = None,
         output_name: str | None = None,
@@ -433,13 +427,9 @@ class LiveKitTransport(BaseTransport):
         self._url = url
         self._token = token
         self._room_name = room_name
-        self._bot_name = bot_name
         self._params = params
 
-        self._client = LiveKitTransportClient(
-            url, token, room_name, bot_name, 
-            self._params, self._create_callbacks(), self._loop
-        )
+        self._client = LiveKitTransportClient(url, token, room_name, self._params, self._create_callbacks(), self._loop)
         self._input: LiveKitInputTransport | None = None
         self._output: LiveKitOutputTransport | None = None
 
