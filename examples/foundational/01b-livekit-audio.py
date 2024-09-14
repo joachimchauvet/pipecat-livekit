@@ -66,14 +66,13 @@ async def main():
     async with aiohttp.ClientSession() as session:
         (url, token, room_name) = await configure_livekit()
 
-        livekit_params = LiveKitParams(
+        transport = LiveKitTransport(
             url=url,
             token=token,
             room_name=room_name,
             participant_name="Say One Thing",
-            audio_out_enabled=True,
+            params=LiveKitParams(audio_out_enabled=True)
         )
-        transport = LiveKitTransport(livekit_params)
 
         tts = CartesiaTTSService(
             api_key=os.getenv("CARTESIA_API_KEY"),
