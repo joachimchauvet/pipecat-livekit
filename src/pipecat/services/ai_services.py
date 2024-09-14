@@ -4,11 +4,12 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
+import asyncio
 import io
 import wave
 
 from abc import abstractmethod
-from typing import AsyncGenerator
+from typing import AsyncGenerator, List, Optional, Tuple
 
 from pipecat.frames.frames import (
     AudioRawFrame,
@@ -17,19 +18,30 @@ from pipecat.frames.frames import (
     ErrorFrame,
     Frame,
     LLMFullResponseEndFrame,
+    STTLanguageUpdateFrame,
+    STTModelUpdateFrame,
     StartFrame,
     StartInterruptionFrame,
+    TTSLanguageUpdateFrame,
+    TTSModelUpdateFrame,
     TTSSpeakFrame,
+    TTSStartedFrame,
+    TTSStoppedFrame,
     TTSVoiceUpdateFrame,
     TextFrame,
+    UserImageRequestFrame,
     VisionImageRawFrame
 )
 from pipecat.processors.async_frame_processor import AsyncFrameProcessor
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.transcriptions.language import Language
 from pipecat.utils.audio import calculate_audio_volume
 from pipecat.utils.string import match_endofsentence
+from pipecat.utils.time import seconds_to_nanoseconds
 from pipecat.utils.utils import exp_smoothing
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+
+from loguru import logger
 
 
 class AIService(FrameProcessor):
@@ -137,11 +149,15 @@ class LLMService(AIService):
             llm=self)
 
     # QUESTION FOR CB: maybe this isn't needed anymore?
-    async def call_start_function(self, function_name: str):
+    async def call_start_function(self, context: OpenAILLMContext, function_name: str):
         if function_name in self._start_callbacks.keys():
-            await self._start_callbacks[function_name](self)
+            await self._start_callbacks[function_name](function_name, self, context)
         elif None in self._start_callbacks.keys():
-            return await self._start_callbacks[None](function_name)
+            return await self._start_callbacks[None](function_name, self, context)
+
+    async def request_image_frame(self, user_id: str, *, text_content: str | None = None):
+        await self.push_frame(UserImageRequestFrame(user_id=user_id, context=text_content),
+                              FrameDirection.UPSTREAM)
 
 
 class TTSService(AIService):
@@ -151,14 +167,30 @@ class TTSService(AIService):
             aggregate_sentences: bool = True,
             # if True, subclass is responsible for pushing TextFrames and LLMFullResponseEndFrames
             push_text_frames: bool = True,
+            # if True, TTSService will push TTSStoppedFrames, otherwise subclass must do it
+            push_stop_frames: bool = False,
+            # if push_stop_frames is True, wait for this idle period before pushing TTSStoppedFrame
+            stop_frame_timeout_s: float = 1.0,
             **kwargs):
         super().__init__(**kwargs)
         self._aggregate_sentences: bool = aggregate_sentences
         self._push_text_frames: bool = push_text_frames
+        self._push_stop_frames: bool = push_stop_frames
+        self._stop_frame_timeout_s: float = stop_frame_timeout_s
+        self._stop_frame_task: Optional[asyncio.Task] = None
+        self._stop_frame_queue: asyncio.Queue = asyncio.Queue()
         self._current_sentence: str = ""
 
     @abstractmethod
+    async def set_model(self, model: str):
+        pass
+
+    @abstractmethod
     async def set_voice(self, voice: str):
+        pass
+
+    @abstractmethod
+    async def set_language(self, language: Language):
         pass
 
     # Converts the text to audio.
@@ -217,14 +249,174 @@ class TTSService(AIService):
                 await self.push_frame(frame, direction)
         elif isinstance(frame, TTSSpeakFrame):
             await self._push_tts_frames(frame.text, False)
+        elif isinstance(frame, TTSModelUpdateFrame):
+            await self.set_model(frame.model)
         elif isinstance(frame, TTSVoiceUpdateFrame):
             await self.set_voice(frame.voice)
+        elif isinstance(frame, TTSLanguageUpdateFrame):
+            await self.set_language(frame.language)
         else:
             await self.push_frame(frame, direction)
+
+    async def start(self, frame: StartFrame):
+        await super().start(frame)
+        if self._push_stop_frames:
+            self._stop_frame_task = self.get_event_loop().create_task(self._stop_frame_handler())
+
+    async def stop(self, frame: EndFrame):
+        await super().stop(frame)
+        if self._stop_frame_task:
+            self._stop_frame_task.cancel()
+            await self._stop_frame_task
+            self._stop_frame_task = None
+
+    async def cancel(self, frame: CancelFrame):
+        await super().cancel(frame)
+        if self._stop_frame_task:
+            self._stop_frame_task.cancel()
+            await self._stop_frame_task
+            self._stop_frame_task = None
+
+    async def push_frame(self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
+        await super().push_frame(frame, direction)
+
+        if self._push_stop_frames and (
+                isinstance(frame, StartInterruptionFrame) or
+                isinstance(frame, TTSStartedFrame) or
+                isinstance(frame, AudioRawFrame) or
+                isinstance(frame, TTSStoppedFrame)):
+            await self._stop_frame_queue.put(frame)
+
+    async def _stop_frame_handler(self):
+        try:
+            has_started = False
+            while True:
+                try:
+                    frame = await asyncio.wait_for(self._stop_frame_queue.get(),
+                                                   self._stop_frame_timeout_s)
+                    if isinstance(frame, TTSStartedFrame):
+                        has_started = True
+                    elif isinstance(frame, (TTSStoppedFrame, StartInterruptionFrame)):
+                        has_started = False
+                except asyncio.TimeoutError:
+                    if has_started:
+                        await self.push_frame(TTSStoppedFrame())
+                        has_started = False
+        except asyncio.CancelledError:
+            pass
+
+
+class AsyncTTSService(TTSService):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    @abstractmethod
+    async def flush_audio(self):
+        pass
+
+
+class AsyncWordTTSService(AsyncTTSService):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._initial_word_timestamp = -1
+        self._words_queue = asyncio.Queue()
+        self._words_task = self.get_event_loop().create_task(self._words_task_handler())
+
+    def start_word_timestamps(self):
+        if self._initial_word_timestamp == -1:
+            self._initial_word_timestamp = self.get_clock().get_time()
+
+    def reset_word_timestamps(self):
+        self._initial_word_timestamp = -1
+        self._word_timestamps = []
+
+    async def add_word_timestamps(self, word_times: List[Tuple[str, float]]):
+        for (word, timestamp) in word_times:
+            await self._words_queue.put((word, seconds_to_nanoseconds(timestamp)))
+
+    async def stop(self, frame: EndFrame):
+        await super().stop(frame)
+        await self._stop_words_task()
+
+    async def cancel(self, frame: CancelFrame):
+        await super().cancel(frame)
+        await self._stop_words_task()
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, LLMFullResponseEndFrame) or isinstance(frame, EndFrame):
+            await self.flush_audio()
+
+    async def _handle_interruption(self, frame: StartInterruptionFrame, direction: FrameDirection):
+        await super()._handle_interruption(frame, direction)
+        self.reset_word_timestamps()
+
+    async def _stop_words_task(self):
+        if self._words_task:
+            self._words_task.cancel()
+            await self._words_task
+
+    async def _words_task_handler(self):
+        while True:
+            try:
+                (word, timestamp) = await self._words_queue.get()
+                if word == "LLMFullResponseEndFrame" and timestamp == 0:
+                    await self.push_frame(LLMFullResponseEndFrame())
+                else:
+                    frame = TextFrame(word)
+                    frame.pts = self._initial_word_timestamp + timestamp
+                    await self.push_frame(frame)
+                self._words_queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.exception(f"{self} exception: {e}")
 
 
 class STTService(AIService):
     """STTService is a base class for speech-to-text services."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    @abstractmethod
+    async def set_model(self, model: str):
+        pass
+
+    @abstractmethod
+    async def set_language(self, language: Language):
+        pass
+
+    @abstractmethod
+    async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame, None]:
+        """Returns transcript as a string"""
+        pass
+
+    async def process_audio_frame(self, frame: AudioRawFrame):
+        await self.process_generator(self.run_stt(frame.audio))
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        """Processes a frame of audio data, either buffering or transcribing it."""
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, AudioRawFrame):
+            # In this service we accumulate audio internally and at the end we
+            # push a TextFrame. We don't really want to push audio frames down.
+            await self.process_audio_frame(frame)
+        elif isinstance(frame, STTModelUpdateFrame):
+            await self.set_model(frame.model)
+        elif isinstance(frame, STTLanguageUpdateFrame):
+            await self.set_language(frame.language)
+        else:
+            await self.push_frame(frame, direction)
+
+
+class SegmentedSTTService(STTService):
+    """SegmentedSTTService is an STTService that will detect speech and will run
+    speech-to-text on speech segments only, instead of a continous stream.
+
+    """
 
     def __init__(self,
                  *,
@@ -246,24 +438,7 @@ class STTService(AIService):
         self._smoothing_factor = 0.2
         self._prev_volume = 0
 
-    @abstractmethod
-    async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame, None]:
-        """Returns transcript as a string"""
-        pass
-
-    def _new_wave(self):
-        content = io.BytesIO()
-        ww = wave.open(content, "wb")
-        ww.setsampwidth(2)
-        ww.setnchannels(self._num_channels)
-        ww.setframerate(self._sample_rate)
-        return (content, ww)
-
-    def _get_smoothed_volume(self, frame: AudioRawFrame) -> float:
-        volume = calculate_audio_volume(frame.audio, frame.sample_rate)
-        return exp_smoothing(volume, self._prev_volume, self._smoothing_factor)
-
-    async def _append_audio(self, frame: AudioRawFrame):
+    async def process_audio_frame(self, frame: AudioRawFrame):
         # Try to filter out empty background noise
         volume = self._get_smoothed_volume(frame)
         if volume >= self._min_volume:
@@ -283,9 +458,7 @@ class STTService(AIService):
             self._silence_num_frames = 0
             self._wave.close()
             self._content.seek(0)
-            await self.start_processing_metrics()
             await self.process_generator(self.run_stt(self._content.read()))
-            await self.stop_processing_metrics()
             (self._content, self._wave) = self._new_wave()
 
     async def stop(self, frame: EndFrame):
@@ -294,16 +467,17 @@ class STTService(AIService):
     async def cancel(self, frame: CancelFrame):
         self._wave.close()
 
-    async def process_frame(self, frame: Frame, direction: FrameDirection):
-        """Processes a frame of audio data, either buffering or transcribing it."""
-        await super().process_frame(frame, direction)
+    def _new_wave(self):
+        content = io.BytesIO()
+        ww = wave.open(content, "wb")
+        ww.setsampwidth(2)
+        ww.setnchannels(self._num_channels)
+        ww.setframerate(self._sample_rate)
+        return (content, ww)
 
-        if isinstance(frame, AudioRawFrame):
-            # In this service we accumulate audio internally and at the end we
-            # push a TextFrame. We don't really want to push audio frames down.
-            await self._append_audio(frame)
-        else:
-            await self.push_frame(frame, direction)
+    def _get_smoothed_volume(self, frame: AudioRawFrame) -> float:
+        volume = calculate_audio_volume(frame.audio, frame.sample_rate)
+        return exp_smoothing(volume, self._prev_volume, self._smoothing_factor)
 
 
 class ImageGenService(AIService):

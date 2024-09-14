@@ -25,8 +25,8 @@ from pipecat.frames.frames import (
     UserStartedSpeakingFrame,
     FunctionCallResultFrame,
     UserStoppedSpeakingFrame)
+from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-from pipecat.transports.base_transport import BaseTransport
 
 from loguru import logger
 
@@ -81,11 +81,6 @@ class RTVIAction(BaseModel):
         return super().model_post_init(__context)
 
 
-#
-# Client -> Pipecat messages.
-#
-
-
 class RTVIServiceOptionConfig(BaseModel):
     name: str
     value: Any
@@ -98,6 +93,16 @@ class RTVIServiceConfig(BaseModel):
 
 class RTVIConfig(BaseModel):
     config: List[RTVIServiceConfig]
+
+
+#
+# Client -> Pipecat messages.
+#
+
+
+class RTVIUpdateConfig(BaseModel):
+    config: List[RTVIServiceConfig]
+    interrupt: bool = False
 
 
 class RTVIActionRunArgument(BaseModel):
@@ -192,6 +197,7 @@ class RTVIBotReadyData(BaseModel):
 class RTVIBotReady(BaseModel):
     label: Literal["rtvi-ai"] = "rtvi-ai"
     type: Literal["bot-ready"] = "bot-ready"
+    id: str
     data: RTVIBotReadyData
 
 
@@ -221,7 +227,7 @@ class RTVILLMFunctionCallResultData(BaseModel):
     function_name: str
     tool_call_id: str
     arguments: dict
-    result: dict
+    result: dict | str
 
 
 class RTVITranscriptionMessageData(BaseModel):
@@ -265,7 +271,6 @@ class RTVIProcessor(FrameProcessor):
 
     def __init__(self,
                  *,
-                 transport: BaseTransport,
                  config: RTVIConfig = RTVIConfig(config=[]),
                  params: RTVIProcessorParams = RTVIProcessorParams()):
         super().__init__()
@@ -274,7 +279,9 @@ class RTVIProcessor(FrameProcessor):
 
         self._pipeline: FrameProcessor | None = None
         self._pipeline_started = False
-        self._first_participant_joined = False
+
+        self._client_ready = False
+        self._client_ready_id = ""
 
         self._registered_actions: Dict[str, RTVIAction] = {}
         self._registered_services: Dict[str, RTVIService] = {}
@@ -284,12 +291,6 @@ class RTVIProcessor(FrameProcessor):
 
         self._message_task = self.get_event_loop().create_task(self._message_task_handler())
         self._message_queue = asyncio.Queue()
-
-        # TODO(aleix): This is very Daily specific. There should be a generic
-        # way to do this.
-        transport.add_event_handler(
-            "on_first_participant_joined",
-            self._on_first_participant_joined)
 
     def register_action(self, action: RTVIAction):
         id = self._action_id(action.service, action.action)
@@ -305,12 +306,18 @@ class RTVIProcessor(FrameProcessor):
         message = RTVIError(data=RTVIErrorData(error=error, fatal=False))
         await self._push_transport_message(message)
 
+    async def set_client_ready(self):
+        if not self._client_ready:
+            self._client_ready = True
+            await self._maybe_send_bot_ready()
+
     async def handle_function_call(
             self,
             function_name: str,
             tool_call_id: str,
             arguments: dict,
-            context,
+            llm: FrameProcessor,
+            context: OpenAILLMContext,
             result_callback):
         fn = RTVILLMFunctionCallMessageData(
             function_name=function_name,
@@ -319,7 +326,11 @@ class RTVIProcessor(FrameProcessor):
         message = RTVILLMFunctionCallMessage(data=fn)
         await self._push_transport_message(message, exclude_none=False)
 
-    async def handle_function_call_start(self, function_name: str):
+    async def handle_function_call_start(
+            self,
+            function_name: str,
+            llm: FrameProcessor,
+            context: OpenAILLMContext):
         fn = RTVILLMFunctionCallStartMessageData(function_name=function_name)
         message = RTVILLMFunctionCallStartMessage(data=fn)
         await self._push_transport_message(message, exclude_none=False)
@@ -345,8 +356,10 @@ class RTVIProcessor(FrameProcessor):
             await self.push_frame(frame, direction)
         # Control frames
         elif isinstance(frame, StartFrame):
-            await self._start(frame)
+            # Push StartFrame before start(), because we want StartFrame to be
+            # processed by every processor before any other frame is processed.
             await self.push_frame(frame, direction)
+            await self._start(frame)
         elif isinstance(frame, EndFrame):
             # Push EndFrame before stop(), because stop() waits on the task to
             # finish and the task finishes when EndFrame is processed.
@@ -374,7 +387,6 @@ class RTVIProcessor(FrameProcessor):
 
     async def _start(self, frame: StartFrame):
         self._pipeline_started = True
-        await self._update_config(self._config)
         await self._maybe_send_bot_ready()
 
     async def _stop(self, frame: EndFrame):
@@ -475,6 +487,8 @@ class RTVIProcessor(FrameProcessor):
 
         try:
             match message.type:
+                case "client-ready":
+                    await self._handle_client_ready(message.id)
                 case "describe-actions":
                     await self._handle_describe_actions(message.id)
                 case "describe-config":
@@ -482,8 +496,8 @@ class RTVIProcessor(FrameProcessor):
                 case "get-config":
                     await self._handle_get_config(message.id)
                 case "update-config":
-                    config = RTVIConfig.model_validate(message.data)
-                    await self._handle_update_config(message.id, config)
+                    update_config = RTVIUpdateConfig.model_validate(message.data)
+                    await self._handle_update_config(message.id, update_config)
                 case "action":
                     action = RTVIActionRun.model_validate(message.data)
                     await self._handle_action(message.id, action)
@@ -500,6 +514,11 @@ class RTVIProcessor(FrameProcessor):
         except Exception as e:
             await self._send_error_response(message.id, f"Exception processing message: {e}")
             logger.warning(f"Exception processing message: {e}")
+
+    async def _handle_client_ready(self, request_id: str):
+        self._client_ready = True
+        self._client_ready_id = request_id
+        await self._maybe_send_bot_ready()
 
     async def _handle_describe_config(self, request_id: str):
         services = list(self._registered_services.values())
@@ -533,17 +552,14 @@ class RTVIProcessor(FrameProcessor):
             await handler(self, service.name, option)
             self._update_config_option(service.name, option)
 
-    async def _update_config(self, data: RTVIConfig):
+    async def _update_config(self, data: RTVIConfig, interrupt: bool):
+        if interrupt:
+            await self.interrupt_bot()
         for service_config in data.config:
             await self._update_service_config(service_config)
 
-    async def _handle_update_config(self, request_id: str, data: RTVIConfig):
-        # NOTE(aleix): The bot might be talking while we receive a new
-        # config. Let's interrupt it for now and update the config. Another
-        # solution is to wait until the bot stops speaking and then apply the
-        # config, but this definitely is more complicated to achieve.
-        await self.interrupt_bot()
-        await self._update_config(data)
+    async def _handle_update_config(self, request_id: str, data: RTVIUpdateConfig):
+        await self._update_config(RTVIConfig(config=data.config), data.interrupt)
         await self._handle_get_config(request_id)
 
     async def _handle_function_call_result(self, data):
@@ -568,19 +584,17 @@ class RTVIProcessor(FrameProcessor):
         message = RTVIActionResponse(id=request_id, data=RTVIActionResponseData(result=result))
         await self._push_transport_message(message)
 
-    async def _on_first_participant_joined(self, transport, participant):
-        self._first_participant_joined = True
-        await self._maybe_send_bot_ready()
-
     async def _maybe_send_bot_ready(self):
-        if self._pipeline_started and self._first_participant_joined:
+        if self._pipeline_started and self._client_ready:
             await self._send_bot_ready()
+            await self._update_config(self._config, False)
 
     async def _send_bot_ready(self):
         if not self._params.send_bot_ready:
             return
 
         message = RTVIBotReady(
+            id=self._client_ready_id,
             data=RTVIBotReadyData(
                 version=RTVI_PROTOCOL_VERSION,
                 config=self._config.config))

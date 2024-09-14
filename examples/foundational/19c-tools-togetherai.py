@@ -14,15 +14,11 @@ from pipecat.frames.frames import LLMMessagesFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.services.cartesia import CartesiaTTSService
-
-from pipecat.services.together import TogetherLLMService, TogetherContextAggregatorPair
+from pipecat.services.together import TogetherLLMService
 from pipecat.transports.services.daily import DailyParams, DailyTransport
 from pipecat.vad.silero import SileroVADAnalyzer
-
-from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
-from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-
 
 from runner import configure
 
@@ -35,7 +31,13 @@ logger.remove(0)
 logger.add(sys.stderr, level="DEBUG")
 
 
-async def get_current_weather(function_name, tool_call_id, arguments, context, result_callback):
+async def get_current_weather(
+        function_name,
+        tool_call_id,
+        arguments,
+        llm,
+        context,
+        result_callback):
     logger.debug("IN get_current_weather")
     location = arguments["location"]
     await result_callback(f"The weather in {location} is currently 72 degrees and sunny.")
@@ -60,7 +62,6 @@ async def main():
         tts = CartesiaTTSService(
             api_key=os.getenv("CARTESIA_API_KEY"),
             voice_id="79a125e8-cd45-4c13-8a67-188112f4dd22",  # British Lady
-            sample_rate=16000,
         )
 
         llm = TogetherLLMService(

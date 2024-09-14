@@ -9,6 +9,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A clock can now be specified to `PipelineTask` (defaults to
+  `SystemClock`). This clock will be passed to each frame processor via the
+  `StartFrame`.
+
+- Added pipeline clocks. A pipeline clock is used by the output transport to
+  know when a frame needs to be presented. For that, all frames now have an
+  optional `pts` field (prensentation timestamp). There's currently just one
+  clock implementation `SystemClock` and the `pts` field is currently only used
+  for `TextFrame`s (audio and image frames will be next).
+
+- `DailyTransport` now supports setting the audio bitrate to improve audio
+  quality through the `DailyParams.audio_out_bitrate` parameter. The new
+  default is 96kbps.
+
+- `DailyTransport` now uses the number of audio output channels (1 or 2) to set
+  mono or stereo audio when needed.
+
+- Interruptions support has been added to `TwilioFrameSerializer` when using
+  `FastAPIWebsocketTransport`.
+
+- Added new `LmntTTSService` text-to-speech service.
+  (see https://www.lmnt.com/)
+
+- Added `TTSModelUpdateFrame`, `TTSLanguageUpdateFrame`, `STTModelUpdateFrame`,
+  and `STTLanguageUpdateFrame` frames to allow you to switch models, language
+  and voices in TTS and STT services.
+
+- Added new `transcriptions.Language` enum.
+
+### Changed
+
+- `CartesiaTTSService` and `ElevenLabsTTSService` now add presentation
+  timestamps to their text output. This allows the output transport to push the
+  text frames downstream at almost the same time the words are spoken. We say
+  "almost" because currently the audio frames don't have presentation timestamp
+  but they should be played at roughly the same time.
+
+- `DailyTransport.on_joined` event now returns the full session data instead of
+  just the participant.
+
+- `CartesiaTTSService` is now a subclass of `TTSService`.
+
+- `DeepgramSTTService` is now a subclass of `STTService`.
+
+- `WhisperSTTService` is now a subclass of `SegmentedSTTService`. A
+  `SegmentedSTTService` is a `STTService` where the provided audio is given in a
+  big chunk (i.e. from when the user starts speaking until the user stops
+  speaking) instead of a continous stream.
+
+### Fixed
+
+- `StartFrame` should be the first frame every processor receives to avoid
+  situations where things are not initialized (because initialization happens on
+  `StartFrame`) and other frames come in resulting in undesired behavior.
+
+### Performance
+
+- `obj_id()` and `obj_count()` now use `itertools.count` avoiding the need of
+  `threading.Lock`.
+
+## [0.0.41] - 2024-08-22
+
+### Added
+
+- Added `LivekitFrameSerializer` audio frame serializer.
+
+### Fixed
+
+- Fix `FastAPIWebsocketOutputTransport` variable name clash with subclass.
+
+- Fix an `AnthropicLLMService` issue with empty arguments in function calling.
+
+### Other
+
+- Fixed `studypal` example errors.
+
+## [0.0.40] - 2024-08-20
+
+### Added
+
+- VAD parameters can now be dynamicallt updated using the
+  `VADParamsUpdateFrame`.
+
 - `ErrorFrame` has now a `fatal` field to indicate the bot should exit if a
   fatal error is pushed upstream (false by default). A new `FatalErrorFrame`
   that sets this flag to true has been added.
@@ -94,6 +177,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   incoming frames to not cancel tasks and be processed properly.
 
 ### Other
+
+- Added `studypal` example (from to the Cartesia folks!).
+
+- Most examples now use Cartesia.
 
 - Added examples `foundational/19a-tools-anthropic.py`,
   `foundational/19b-tools-video-anthropic.py` and
